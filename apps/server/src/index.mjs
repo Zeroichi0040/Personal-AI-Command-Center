@@ -8,20 +8,28 @@ import { SessionManager } from './sessions.mjs';
 import { buildServer } from './http.mjs';
 
 const port=4317;
-const cwd=await realpath(process.env.PACC_WORKSPACE||process.cwd());
-const store=new HistoryStore(resolve(process.env.PACC_DATA_PATH||join(homedir(),'.pacc','history.sqlite')));
-const manager=new SessionManager({createSession:createCodexSession,store});
-let app;
+const path=resolve(process.env.PACC_DATA_PATH||join(homedir(),'.pacc','history.sqlite'));
+const manager=new SessionManager({createSession:createCodexSession});
+manager.booting=true;
+let app,restored=false,closing=false;
+async function close(){
+  if(closing)return;closing=true;
+  try{manager.close({persist:restored});}catch(error){console.error(error.message);}
+  if(app){app.websocketServer?.clients.forEach(socket=>socket.terminate());await app.close();}
+}
+process.once('SIGINT',close);process.once('SIGTERM',close);
 try {
-  if(!manager.restore()){
+  // Bind before opening the database: a second local instance cannot overwrite it.
+  app=await buildServer(manager,{port,staticRoot:fileURLToPath(new URL('../../../dist/',import.meta.url))});
+  await app.listen({host:'127.0.0.1',port});
+  manager.store=new HistoryStore(path);
+  const initialized=manager.restore();restored=true;
+  if(!initialized){
+    const cwd=await realpath(process.env.PACC_WORKSPACE||process.cwd());
     const projectId=await manager.register(cwd,undefined,{allowDirectory:true});
     await manager.addSession(projectId,'Current conversation',process.env.PACC_WORKSPACE_WRITE==='1'?'existing':'read-only');
   }
-  app=await buildServer(manager,{port,staticRoot:fileURLToPath(new URL('../../../dist/',import.meta.url))});
-  await app.listen({host:'127.0.0.1',port});
+  manager.booting=false;
   console.log('PACC: http://127.0.0.1:'+port);
-  console.log('Workspace: '+cwd);
-}catch(error){manager.close();if(app)await app.close();console.error(error.message);process.exitCode=1;}
-let closing=false;
-async function close(){if(closing)return;closing=true;manager.close();if(app){app.websocketServer?.clients.forEach(socket=>socket.terminate());await app.close();}}
-process.once('SIGINT',close);process.once('SIGTERM',close);
+  console.log('History: '+path);
+}catch(error){await close();console.error(error.message);process.exitCode=1;}

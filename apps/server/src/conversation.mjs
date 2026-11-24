@@ -96,6 +96,7 @@ export class Conversation extends EventEmitter {
     this.startedAt = Date.now(); this.endedAt = null; this.items.clear(); this.fileChanges.clear(); this.commandItems.clear();
     this.messages.push({ id: randomUUID(), kind: 'user', text: message.text }); this.emitState();
     try {
+      this.checkpoint?.();
       if (!this.threadId) {
         const result = await this.client.request('thread/start', { cwd: this.cwd, sandbox: this.writable ? 'workspace-write' : 'read-only', approvalPolicy: 'on-request' });
         if (typeof result?.thread?.id !== 'string') throw new Error('Missing thread ID');
@@ -103,6 +104,7 @@ export class Conversation extends EventEmitter {
         // Checkpoint the native ID before dispatching any model work.
         this.emitState();
       }
+      this.checkpoint?.();
       const result = await this.client.request('turn/start', {
         threadId: this.threadId, input: input(message.text), cwd: this.cwd, approvalPolicy: 'on-request',
         sandboxPolicy: this.writable ? { type: 'workspaceWrite', writableRoots: [this.cwd], networkAccess: false } : { type: 'readOnly' },

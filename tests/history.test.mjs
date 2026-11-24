@@ -43,3 +43,26 @@ test('native resume uses same ID and no turn/start or replay',async()=>{
   assert.equal(c.threadId,'native');assert.equal(c.status,'idle');assert.equal(c.messages.length,1);assert.deepEqual(c.queue,[]);assert.equal(c.pending.size,0);
   assert.equal(client.calls.find(x=>x.method==='thread/resume').p.sandbox,'read-only');assert.equal(client.calls.some(x=>x.method==='turn/start'),false);
 });
+
+test('missing workspace leaves history available without launching a runtime',async()=>{
+  const store=new HistoryStore(':memory:');
+  store.save([{id:'p',root:'/missing',name:'Missing'}],[{id:'s',projectId:'p',name:'Saved',mode:'read-only',cwd:'/missing',writable:false,saved:{threadId:'native',status:'completed',messages:[{id:'m',kind:'user',text:'preserved text'}]}}]);
+  let created=0;
+  const m=new SessionManager({store,workspace:{directory:async()=>{throw Error('missing directory');}},createSession:()=>{created++;}});
+  m.restore();
+  await assert.rejects(m.reconnect('s',false),/missing directory/);
+  assert.equal(created,0);assert.equal(m.snapshot().sessions[0].conversation.connected,false);
+  assert.equal((await m.dispatch({action:'searchHistory',query:'preserved'})).results.length,1);
+  assert.equal((await m.dispatch({action:'exportSession',sessionId:'s'})).export.messages[0].text,'preserved text');m.close();
+});
+test('failed checkpoint prevents dispatching a model turn',async()=>{
+  class Client extends EventEmitter{
+    calls=[];async initialize(){}
+    async request(method,p){this.calls.push(method);if(method==='account/read')return {account:{type:'chatgpt'}};if(method==='model/list')return {data:[]};if(method==='thread/start')return {thread:{id:'native'}};throw Error(method);}
+  }
+  const client=new Client(),c=new Conversation({client,cwd:process.cwd()});
+  await c.initialize();
+  c.checkpoint=()=>{if(c.threadId)throw Error('database unavailable');};
+  await c.send({text:'do not replay'});
+  assert.equal(c.status,'uncertain');assert.equal(client.calls.includes('turn/start'),false);
+});

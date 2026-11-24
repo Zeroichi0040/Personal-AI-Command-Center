@@ -44,7 +44,7 @@ export class HistoryStore {
   }
   search(query){
     if(typeof query!=='string'||query.length>300)throw Error('Search must be at most 300 characters');
-    const terms=query.trim().split(/\s+/u).filter(Boolean).slice(0,12);
+    const terms=query.trim().split(/\s+/u).filter(term=>/[\p{L}\p{N}]/u.test(term)).slice(0,12);
     if(!terms.length)return [];
     const expression=terms.map(term=>'"'+term.replaceAll('"','""')+'"').join(' AND ');
     return this.db.prepare("SELECT session_id AS sessionId,message_id AS messageId,snippet(history_fts,2,'','', ' … ',24) AS snippet FROM history_fts WHERE history_fts MATCH ? ORDER BY rank LIMIT 50").all(expression);

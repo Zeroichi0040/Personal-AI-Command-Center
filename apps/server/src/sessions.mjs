@@ -22,7 +22,7 @@ export class SessionManager extends EventEmitter {
     this.projects=new Map();this.sessions=new Map();this.creating=new Map();this.closed=false;this.store=store;this.saveTimer=null;this.storageError=null;
   }
   records(){
-    return [...this.sessions.values()].map(s=>({id:s.id,projectId:s.projectId,name:s.name,mode:s.mode,cwd:s.cwd,writable:s.writable,branch:s.branch,git:s.git,autoName:!!s.autoName,preferences:s.preferences||{},saved:s.conversation instanceof OfflineConversation?s.conversation.saved:savedState(s.conversation)}));
+    return [...this.sessions.values()].map(s=>({id:s.id,projectId:s.projectId,name:s.name,mode:s.mode,cwd:s.cwd,writable:s.writable,branch:s.branch,worktreeBranch:s.worktreeBranch??(s.mode==='isolated'?s.branch:null),git:s.git,autoName:!!s.autoName,preferences:s.preferences||{},saved:s.conversation instanceof OfflineConversation?s.conversation.saved:savedState(s.conversation)}));
   }
   flush(){
     if(this.saveTimer!==null){clearTimeout(this.saveTimer);this.saveTimer=null;}
@@ -34,7 +34,7 @@ export class SessionManager extends EventEmitter {
     if(this.store){
       if(mode==='stream'){
         if(this.saveTimer===null)this.saveTimer=setTimeout(()=>{try{this.flush();}catch{this.emit('state',null,'immediate');}},250);
-      }else this.flush();
+      }else {try{this.flush();}catch{/* checkpoint errors remain visible and block new work */}}
     }
     this.emit('state',null,mode);
   }
@@ -51,7 +51,7 @@ export class SessionManager extends EventEmitter {
   }
   async reconnect(id,acknowledge){
     const s=this.session(id);
-    if(s.reconnecting||occupied(s))throw Error('Session is busy');
+    if(s.reconnecting||occupied(s))throw Error('Session is busy or uncertain; restart PACC if disconnected during a turn');
     if(s.conversation.snapshot().connected)throw Error('Session is already connected');
     const saved=s.conversation instanceof OfflineConversation?s.conversation.saved:savedState(s.conversation);
     const interrupted=s.interrupted||['starting','running','stopping','uncertain'].includes(saved.status);
@@ -64,7 +64,7 @@ export class SessionManager extends EventEmitter {
       if(root!==this.project(s.projectId).root||cwd!==s.cwd)throw Error('Workspace path changed; refusing to resume');
       if(s.mode==='isolated'){
         const details=await this.workspace.inspect(cwd);
-        if(details.branch!==s.branch||await this.workspace.repoRoot(cwd)!==cwd)throw Error('Saved worktree or branch changed; refusing to resume');
+        if(details.branch!==(s.worktreeBranch??s.branch)||await this.workspace.repoRoot(cwd)!==cwd)throw Error('Saved worktree or branch changed; refusing to resume');
       }
       if(s.writable&&[...this.sessions.values(),...this.creating.values()].some(other=>other.id!==id&&other.writable&&other.cwd&&this.workspace.overlaps(other.cwd,cwd)))throw Error('Writable workspace conflicts with another session');
       if(this.closed)throw Error('Manager closed');
@@ -74,6 +74,7 @@ export class SessionManager extends EventEmitter {
       s.conversation.off('state',s.listener);s.close();
       s.conversation=runtime.conversation;s.close=runtime.close;s.interrupted=false;
       s.listener=(_state,mode)=>this.emitState(mode);
+      s.conversation.checkpoint=()=>this.flush();
       s.conversation.on('state',s.listener);
     }catch(error){
       runtime?.close();
@@ -119,10 +120,10 @@ export class SessionManager extends EventEmitter {
       const conversation=runtime.conversation;
       await conversation.initialize();
       if(this.closed)throw Error('Manager is closed');
-      const s={...pending,name:sessionName,mode,branch:location.branch,git:null,conversation,close:runtime.close,autoName:!name,preferences:{}};
+      const s={...pending,name:sessionName,mode,branch:location.branch,worktreeBranch:location.branch,git:null,conversation,close:runtime.close,autoName:!name,preferences:{}};
       // Initialization is complete before exposing the session to actions.
       const listener=(_state,eventMode)=>this.emitState(eventMode);
-      s.listener=listener;conversation.on('state',listener);
+      s.listener=listener;conversation.checkpoint=()=>this.flush();conversation.on('state',listener);
       this.sessions.set(id,s);this.emitState();return id;
     }catch(error){
       runtime?.close();
@@ -134,7 +135,7 @@ export class SessionManager extends EventEmitter {
   closeSession(id){const s=this.session(id);if(occupied(s)||s.reconnecting)throw Error('Stop active work first; uncertain sessions require a server restart');s.conversation.off('state',s.listener);this.sessions.delete(id);s.close();this.emitState();}
   async dispatch(data){
     if(this.closed)throw Error('Manager is closed');
-    if(this.storageError&&['send','steer','approval','createSession','reconnect'].includes(data?.action))throw Error(this.storageError);
+    if(this.storageError&&(['send','steer','createSession','reconnect'].includes(data?.action)||(data?.action==='approval'&&data.decision==='accept')))throw Error(this.storageError);
     switch(data?.action){
       case 'registerProject':return {projectId:await this.register(data.path,data.name)};
       case 'renameProject':this.renameProject(data.projectId,data.name);return {};
@@ -174,5 +175,5 @@ export class SessionManager extends EventEmitter {
     }
     return {};
   }
-  close(){this.closed=true;try{this.flush();}finally{for(const s of this.sessions.values()){s.conversation.off('state',s.listener);s.close();}this.sessions.clear();this.store?.close();}}
+  close({persist=true}={}){this.closed=true;try{if(persist)this.flush();}finally{for(const s of this.sessions.values()){s.conversation.off('state',s.listener);s.close();}this.sessions.clear();this.store?.close();}}
 }
