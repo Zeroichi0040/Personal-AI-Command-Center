@@ -5,3 +5,4 @@ node_modules/
 .pacc/
 .worktrees/
 coverage/
+dist/
