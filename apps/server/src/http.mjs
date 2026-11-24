@@ -22,6 +22,7 @@ export async function buildServer(conversation, { port = 4317, staticRoot } = {}
   app.post('/api/action', async (req, reply) => {
     const data = req.body;
     try {
+      if (typeof conversation.dispatch === 'function') return {ok:true,...await conversation.dispatch(data)};
       switch (data?.action) {
         case 'send': await conversation.send(data); break;
         case 'stop': await conversation.stop(); break;
