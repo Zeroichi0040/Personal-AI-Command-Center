@@ -43,7 +43,7 @@ export class CodexClient extends EventEmitter {
         // Do not log server request parameters; they may contain private data.
         if (this.#serverRequest) {
           Promise.resolve().then(() => this.#serverRequest(message)).then(
-            result => { if (!this.#closed) this.#write({ id: message.id, result }); },
+            result => { if (!this.#closed && result !== undefined) this.#write({ id: message.id, result }); },
             () => { if (!this.#closed) this.#write({ id: message.id, error: { code: -32601, message: 'Unsupported or cancelled server request' } }); }
           ).catch(error => this.#fail(error));
         } else {
@@ -79,7 +79,7 @@ export class CodexClient extends EventEmitter {
     if (this.#ready || this.#initializing) throw new Error('Already initialized or initializing');
     this.#initializing = true;
     try {
-      const info = await this.#request('initialize', { clientInfo: { name: 'personal_ai_command_center', title: 'Personal AI Command Center', version: '0.1.0-dev.1' } });
+      const info = await this.#request('initialize', { clientInfo: { name: 'personal_ai_command_center', title: 'Personal AI Command Center', version: '0.1.0-rc.1' } });
       this.#write({ method: 'initialized' });
       this.#ready = true; return info;
     } catch (error) { this.#fail(error); throw error; }

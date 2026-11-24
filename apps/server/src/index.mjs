@@ -23,13 +23,16 @@ try {
   app=await buildServer(manager,{port,staticRoot:fileURLToPath(new URL('../../../dist/',import.meta.url))});
   await app.listen({host:'127.0.0.1',port});
   manager.store=new HistoryStore(path);
+  if(closing){manager.store.close();throw Error('Startup cancelled');}
   const initialized=manager.restore();restored=true;
   if(!initialized){
     const cwd=await realpath(process.env.PACC_WORKSPACE||process.cwd());
     const projectId=await manager.register(cwd,undefined,{allowDirectory:true});
     await manager.addSession(projectId,'Current conversation',process.env.PACC_WORKSPACE_WRITE==='1'?'existing':'read-only');
   }
+  manager.flush();
   manager.booting=false;
+  if(manager.store.migrationBackup)console.log('Pre-migration backup: '+manager.store.migrationBackup);
   console.log('PACC: http://127.0.0.1:'+port);
   console.log('History: '+path);
 }catch(error){await close();console.error(error.message);process.exitCode=1;}

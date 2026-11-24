@@ -72,7 +72,7 @@ test('server-resolved approvals cannot be accepted later',async()=>{
   const {c,client}=await setup();await c.send({text:'first'});
   const p=c.requestApproval({id:123,method:'item/commandExecution/requestApproval',params:{threadId:'thread',turnId:'turn1',command:'echo x'}});
   const id=c.snapshot().approvals[0].id;client.emit('notification',{method:'serverRequest/resolved',params:{threadId:'thread',requestId:123}});
-  assert.deepEqual(await p,{decision:'decline'});assert.throws(()=>c.resolveApproval(id,'accept'));
+  assert.equal(await p,undefined);assert.throws(()=>c.resolveApproval(id,'accept'));
 });
 
 test('one-time command approval tolerates optional persistent-policy hints',async()=>{

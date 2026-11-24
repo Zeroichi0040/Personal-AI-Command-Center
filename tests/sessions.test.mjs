@@ -66,3 +66,13 @@ test('real Git worktree creates a separate branch without copying dirty changes'
   assert.equal((await git.inspect(worktree.cwd)).diff,'');
   assert.equal(git.overlaps(root,worktree.cwd),false);
 });
+
+test('failed metadata checkpoint rolls back registration',async()=>{
+  const {HistoryStore}=await import('../apps/server/src/history.mjs');
+  const store=new HistoryStore(':memory:');
+  const manager=new SessionManager({store,workspace:{repoRoot:async p=>p,overlaps:(a,b)=>a===b},createSession:()=>{throw Error('must not launch');}});
+  // Test project rollback without requiring a runtime.
+  const save=store.save.bind(store);store.save=()=>{throw Error('disk failure');};
+  await assert.rejects(manager.register(join(tmpdir(),'rollback-project')),/disk failure/);
+  assert.equal(manager.projects.size,0);store.save=save;manager.close();
+});
