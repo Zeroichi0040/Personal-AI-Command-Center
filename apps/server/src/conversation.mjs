@@ -5,6 +5,18 @@ const input = text => [{ type: 'text', text }];
 const bounded = (text, max = 100_000) => typeof text === 'string' ? text.slice(0, max) : '';
 const terminal = new Set(['completed','interrupted','failed']);
 const approvals = new Set(['item/commandExecution/requestApproval','item/fileChange/requestApproval']);
+function toolLabel(item) {
+  if (item.type === 'commandExecution') {
+    const command = Array.isArray(item.commandActions) && item.commandActions.length &&
+      item.commandActions.every(action => typeof action?.command === 'string' && action.command.trim())
+      ? item.commandActions.map(action => action.command).join(' · ') : item.command;
+    const full = typeof command === 'string' ? command.replace(/\s+/g,' ').trim() : '';
+    const preview = full.length > 100 ? full.slice(0,97) + '…' : full;
+    const verb = item.status === 'declined' ? 'Declined command' : item.status === 'failed' || (item.status === 'completed' && item.exitCode != null && item.exitCode !== 0) ? 'Command failed' : item.status === 'completed' ? 'Ran' : 'Running';
+    return preview ? verb + ' ' + preview : verb;
+  }
+  return ({fileChange:'File changes',mcpToolCall:'MCP tool',dynamicToolCall:'Tool call',webSearch:'Web search',plan:'Plan',collabAgentToolCall:'Agent activity'})[item.type] || 'Tool activity';
+}
 const allowedTools = new Set(['commandExecution','fileChange','mcpToolCall','dynamicToolCall','webSearch','plan','collabAgentToolCall']);
 export class Conversation extends EventEmitter {
   constructor({ client, cwd, writable = false }) {
@@ -13,7 +25,7 @@ export class Conversation extends EventEmitter {
     this.connected = false; this.threadId = null; this.turnId = null;
     this.status = 'connecting'; this.startedAt = null; this.endedAt = null;
     this.messages = []; this.queue = []; this.models = []; this.pending = new Map();
-    this.early = []; this.error = null; this.items = new Map(); this.fileChanges = new Map();
+    this.early = []; this.error = null; this.items = new Map(); this.fileChanges = new Map(); this.commandItems = new Map();
     this.client.on('notification', n => this.onEvent(n));
     this.client.on('disconnect', () => {
       this.connected = false; this.status = 'disconnected'; this.endedAt = Date.now();
@@ -26,7 +38,7 @@ export class Conversation extends EventEmitter {
       turnReady: !!this.turnId && this.status === 'running', messages: this.messages, queue: this.queue,
       models: this.models, approvals: [...this.pending.values()].map(({ publicData }) => publicData), error: this.error };
   }
-  emitState() { this.emit('state', this.snapshot()); }
+  emitState(mode = 'immediate') { this.emit('state', this.snapshot(), mode); }
   async initialize() {
     await this.client.initialize();
     const { account } = await this.client.request('account/read', { refreshToken: false });
@@ -66,7 +78,7 @@ export class Conversation extends EventEmitter {
   }
   async start(message) {
     this.status = 'starting'; this.error = null; this.turnId = null; this.early = [];
-    this.startedAt = Date.now(); this.endedAt = null; this.items.clear(); this.fileChanges.clear();
+    this.startedAt = Date.now(); this.endedAt = null; this.items.clear(); this.fileChanges.clear(); this.commandItems.clear();
     this.messages.push({ id: randomUUID(), kind: 'user', text: message.text }); this.emitState();
     try {
       if (!this.threadId) {
@@ -113,6 +125,7 @@ export class Conversation extends EventEmitter {
       let item = this.items.get(key);
       if (!item) { item = { id: key, kind, text: '', startedAt: Date.now() }; this.items.set(key,item); this.messages.push(item); }
       item.text = bounded(item.text + bounded(p.delta));
+      this.emitState('stream'); return;
     } else if (method === 'item/started' || method === 'item/completed') {
       const item = p.item;
       if (!item || typeof item.id !== 'string') return;
@@ -124,9 +137,11 @@ export class Conversation extends EventEmitter {
       } else if (allowedTools.has(item.type)) {
         const key = this.turnId + ':' + item.id + ':tool';
         if (item.type === 'fileChange' && method === 'item/started') this.fileChanges.set(key, JSON.stringify(item,null,2));
+        if (item.type === 'commandExecution' && method === 'item/started') this.commandItems.set(key,item);
+        if (method === 'item/completed') { this.commandItems.delete(key); this.fileChanges.delete(key); }
         let record = this.items.get(key);
         if (!record) { record = { id:key,kind:'tool',text:item.type,startedAt:Date.now() }; this.items.set(key,record); this.messages.push(record); }
-        record.text = bounded(JSON.stringify(item, null, 2)); record.label = item.type;
+        record.text = bounded(JSON.stringify(item, null, 2)); record.label = toolLabel(item);
         if (method === 'item/completed') record.endedAt = Date.now();
       } else if (item.type === 'reasoning' && method === 'item/completed') {
         for (const [key, record] of this.items) if (key.startsWith(this.turnId + ':' + item.id + ':reasoning:')) record.endedAt = Date.now();
@@ -157,22 +172,50 @@ export class Conversation extends EventEmitter {
     this.messages.push({ id:randomUUID(),kind:'user',text,label:'Steered' }); this.emitState();
   }
   removeQueued(id) { this.queue = this.queue.filter(m => m.id !== id); this.emitState(); }
+  approvalDiagnostic(reason) {
+    const now = Date.now();
+    this.messages.push({ id:randomUUID(),kind:'tool',label:'Approval automatically declined — ' + reason,text:reason,startedAt:now,endedAt:now });
+    this.emitState();
+  }
   requestApproval({ id:requestId, method, params }) {
-    if (!approvals.has(method) || !params || typeof params.turnId !== 'string' || params.threadId !== this.threadId || !this.active() || this.status === 'stopping' || (this.turnId && params.turnId !== this.turnId)) return Promise.reject(new Error('Unsupported request'));
-    // No session-wide grants, network approvals, or policy amendments in this milestone.
+    const scoped = params && params.threadId === this.threadId && this.threadId && this.active();
+    if (!approvals.has(method) || !scoped || typeof params.turnId !== 'string' || this.status === 'stopping' || (this.turnId && params.turnId !== this.turnId)) {
+      if (this.active() && (!params?.threadId || params.threadId === this.threadId)) this.approvalDiagnostic(!approvals.has(method) ? 'Unsupported request type: ' + bounded(method,120) : 'Request is not scoped to the active turn');
+      return Promise.reject(new Error('Unsupported request'));
+    }
+    const decline = reason => { this.approvalDiagnostic(reason); return Promise.resolve({ decision:'decline' }); };
+    if (JSON.stringify(params).length > 100_000) return decline('Approval request is too large to review safely');
+    if (params.networkApprovalContext != null) return decline('Managed network approvals are not supported');
+    if (params.additionalPermissions != null) return decline('Additional sandbox permissions are not supported');
+    if (params.grantRoot != null) return decline('Persistent filesystem grants are not supported');
+    // Optional persistence proposals are hints only. Never return a policy amendment or session grant.
     const decisions = params.availableDecisions;
-    const command = typeof params.command === 'string' && params.command.trim();
-    const fileItem = this.fileChanges.get(params.turnId + ':' + params.itemId + ':tool');
-    // Early item events may be buffered until turn/start is acknowledged.
-    const earlyFile = this.early.find(e => e.method === 'item/started' && e.params?.turnId === params.turnId && e.params?.item?.id === params.itemId && e.params?.item?.type === 'fileChange');
-    const details = method.includes('fileChange') ? (fileItem || (earlyFile && JSON.stringify(earlyFile.params.item,null,2))) : null;
-    if (JSON.stringify(params).length > 100_000 || (details && details.length > 100_000) || params.networkApprovalContext || params.additionalPermissions || params.proposedExecpolicyAmendment || params.grantRoot ||
-        (method.includes('commandExecution') && !command) || (method.includes('fileChange') && !details) ||
-        (Array.isArray(decisions) && !decisions.includes('accept'))) return Promise.resolve({ decision:'decline' });
+    if (decisions != null && (!Array.isArray(decisions) || !decisions.includes('accept'))) return decline('Runtime did not offer one-time acceptance');
+    const isCommand = method === 'item/commandExecution/requestApproval';
+    const type = isCommand ? 'commandExecution' : 'fileChange';
+    const key = params.turnId + ':' + params.itemId + ':tool';
+    const earlyItem = typeof params.itemId === 'string' && this.early.find(e => e.method === 'item/started' && e.params?.threadId === this.threadId && e.params?.turnId === params.turnId && e.params?.item?.id === params.itemId && e.params?.item?.type === type)?.params.item;
+    let review;
+    if (isCommand) {
+      const item = this.commandItems.get(key) || earlyItem;
+      const hasText = value => typeof value === 'string' && value.trim().length > 0;
+      const command = hasText(params.command) ? params.command : item?.command;
+      if (!hasText(command)) return decline('No reviewable command in the request or matching started item');
+      const cwd = params.cwd ?? item?.cwd ?? null;
+      review = { command, cwd, reason:params.reason ?? null, request:params, ...(item ? { startedItem:{command:item.command,cwd:item.cwd} } : {}) };
+    } else {
+      const details = this.fileChanges.get(key) || (earlyItem && JSON.stringify(earlyItem,null,2));
+      if (!details) return decline('No matching proposed file changes to review');
+      review = { request:params, fileChange:JSON.parse(details) };
+    }
+    const details = JSON.stringify(review,null,2);
+    if (details.length > 100_000) return decline('Operation details are too large to review safely');
     const id = randomUUID();
     return new Promise(resolve => {
-      const timer = setTimeout(() => this.resolveApproval(id,'decline'), 300_000);
-      this.pending.set(id,{ resolve,timer,requestId,turnId:params.turnId,publicData:{ id,method,details:JSON.stringify({ request:params, fileChange:details },null,2) } });
+      const timer = setTimeout(() => {
+        if (this.pending.has(id)) { this.approvalDiagnostic('Approval expired'); this.resolveApproval(id,'decline'); }
+      },300_000);
+      this.pending.set(id,{resolve,timer,requestId,turnId:params.turnId,publicData:{id,method,details}});
       this.emitState();
     });
   }

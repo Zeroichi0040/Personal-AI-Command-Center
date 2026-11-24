@@ -74,3 +74,76 @@ test('server-resolved approvals cannot be accepted later',async()=>{
   const id=c.snapshot().approvals[0].id;client.emit('notification',{method:'serverRequest/resolved',params:{threadId:'thread',requestId:123}});
   assert.deepEqual(await p,{decision:'decline'});assert.throws(()=>c.resolveApproval(id,'accept'));
 });
+
+test('one-time command approval tolerates optional persistent-policy hints',async()=>{
+  const {c}=await setup();await c.send({text:'first'});
+  const p=c.requestApproval({id:1,method:'item/commandExecution/requestApproval',params:{threadId:'thread',turnId:'turn1',itemId:'cmd',command:'git status --short',proposedExecpolicyAmendment:['git','status'],availableDecisions:['accept','acceptForSession',{acceptWithExecpolicyAmendment:{execpolicy_amendment:['git','status']}},'decline']}});
+  const approval=c.snapshot().approvals[0];assert.ok(approval);assert.match(approval.details,/git status --short/);
+  assert.throws(()=>c.resolveApproval(approval.id,'acceptForSession'));
+  c.resolveApproval(approval.id,'accept');assert.deepEqual(await p,{decision:'accept'});
+});
+test('omitted command is recovered only from the matching active started item',async()=>{
+  const {c,client}=await setup();await c.send({text:'first'});
+  client.emit('notification',{method:'item/started',params:{threadId:'thread',turnId:'turn1',item:{id:'cmd',type:'commandExecution',command:'git status --short',cwd:'/repo',status:'inProgress'}}});
+  const params={threadId:'thread',turnId:'turn1',itemId:'cmd'};
+  const p=c.requestApproval({method:'item/commandExecution/requestApproval',params});
+  const approval=c.snapshot().approvals[0];assert.equal(JSON.parse(approval.details).command,'git status --short');assert.equal(JSON.parse(approval.details).cwd,'/repo');
+  c.resolveApproval(approval.id,'decline');assert.deepEqual(await p,{decision:'decline'});
+  assert.deepEqual(await c.requestApproval({method:'item/commandExecution/requestApproval',params:{...params,itemId:'other'}}),{decision:'decline'});
+  assert.match(c.messages.at(-1).label,/No reviewable command/);
+  client.emit('notification',{method:'item/completed',params:{threadId:'thread',turnId:'turn1',item:{id:'cmd',type:'commandExecution',command:'git status --short',status:'declined'}}});
+  assert.equal(c.messages.find(m=>m.id==='turn1:cmd:tool').label,'Declined command git status --short');
+  assert.deepEqual(await c.requestApproval({method:'item/commandExecution/requestApproval',params}),{decision:'decline'});
+});
+test('actual permission requests remain blocked with visible reasons',async()=>{
+  const {c}=await setup();await c.send({text:'first'});
+  const params={threadId:'thread',turnId:'turn1',itemId:'cmd',command:'echo test'};
+  for(const [fields,reason] of [[{networkApprovalContext:{host:'example.com'}},/network approvals/],[{additionalPermissions:{network:{enabled:true}}},/Additional sandbox permissions/],[{grantRoot:'/other'},/filesystem grants/],[{availableDecisions:['acceptForSession','decline']},/one-time acceptance/]]){
+    assert.deepEqual(await c.requestApproval({method:'item/commandExecution/requestApproval',params:{...params,...fields}}),{decision:'decline'});
+    assert.equal(c.snapshot().approvals.length,0);assert.match(c.messages.at(-1).label,reason);
+  }
+  await assert.rejects(c.requestApproval({method:'item/permissions/requestApproval',params}));assert.match(c.messages.at(-1).label,/Unsupported request type/);
+});
+test('file approval shows matching proposed changes and does not grant roots',async()=>{
+  const {c,client}=await setup();await c.send({text:'first'});
+  client.emit('notification',{method:'item/started',params:{threadId:'thread',turnId:'turn1',item:{id:'file',type:'fileChange',changes:[{path:'a.txt',diff:'+test'}],status:'inProgress'}}});
+  const params={threadId:'thread',turnId:'turn1',itemId:'file'};
+  const p=c.requestApproval({method:'item/fileChange/requestApproval',params});
+  const approval=c.snapshot().approvals[0];assert.match(approval.details,/a.txt/);
+  c.resolveApproval(approval.id,'accept');assert.deepEqual(await p,{decision:'accept'});
+  assert.deepEqual(await c.requestApproval({method:'item/fileChange/requestApproval',params:{...params,grantRoot:'/other'}}),{decision:'decline'});
+});
+
+test('WebSocket authenticates and reconnects to current state; stream snapshots coalesce', {timeout:10000}, async t=>{
+  const {c,client}=await setup();const app=await buildServer(c);await app.ready();
+  const host='127.0.0.1:4317',origin='http://'+host;
+  const token=(await app.inject({url:'/api/bootstrap',headers:{host}})).json().token;
+  const sockets=[];t.after(async()=>{for(const socket of sockets)socket.terminate();await app.close();});
+  const open=async(headers={host,origin})=>{const socket=await app.injectWS('/events',{headers});sockets.push(socket);return socket;};
+  await assert.rejects(open({host,origin:'https://example.com'}));
+  const bad=await open();const closed=new Promise(resolve=>bad.once('close',resolve));bad.send('invalid');assert.equal(await closed,1008);
+  const collect=async()=>{
+    const socket=await open(),states=[];
+    socket.on('message',data=>states.push(JSON.parse(data.toString())));
+    socket.send(token);
+    return {socket,states};
+  };
+  const waitFor=async pred=>{for(let i=0;i<200;i++){if(pred())return;await new Promise(r=>setTimeout(r,10));}throw Error('Missing WebSocket update');};
+  const first=await collect();await waitFor(()=>first.states.length===1);
+  await c.send({text:'test'});await waitFor(()=>first.states.at(-1)?.status==='running');
+  const before=first.states.length;
+  for(let i=0;i<25;i++)client.emit('notification',{method:'item/agentMessage/delta',params:{threadId:'thread',turnId:'turn1',itemId:'a',delta:'x'}});
+  await waitFor(()=>first.states.at(-1)?.messages.at(-1)?.text==='early'+'x'.repeat(25));
+  assert.equal(first.states.length,before+1);
+  client.emit('notification',{method:'item/agentMessage/delta',params:{threadId:'thread',turnId:'turn1',itemId:'a',delta:'!'}});
+  const approval=c.requestApproval({method:'item/commandExecution/requestApproval',params:{threadId:'thread',turnId:'turn1',command:'echo test'}});
+  try {
+    await waitFor(()=>first.states.at(-1)?.approvals.length===1);
+    assert.equal(first.states.at(-1).messages.at(-1).text,'early'+'x'.repeat(25)+'!');
+    const approvalId=c.snapshot().approvals[0].id;
+    first.socket.close();const second=await collect();await waitFor(()=>second.states.length===1);
+    assert.equal(second.states[0].approvals[0].id,approvalId);assert.equal(second.states[0].threadId,'thread');
+    c.resolveApproval(approvalId,'decline');assert.deepEqual(await approval,{decision:'decline'});
+    client.finish();await waitFor(()=>second.states.at(-1)?.status==='completed');assert.equal(second.states.at(-1).approvals.length,0);
+  }finally{c.clearApprovals();}
+});

@@ -37,17 +37,23 @@ export async function buildServer(conversation, { port = 4317, staticRoot } = {}
     if (req.headers.origin !== origin) return reply.code(403).send({error:'Invalid socket origin'});
   } }, socket => {
     let authenticated = false;
+    let streamTimer = null;
     const send = state => {
       if (socket.readyState !== 1) return;
       if (socket.bufferedAmount > 2_000_000) { socket.close(1013,'Slow client'); return; }
       socket.send(JSON.stringify(state), err => { if (err) socket.terminate(); });
     };
     const timer = setTimeout(() => socket.close(1008,'Authentication required'),5000);
-    const cleanup = () => { clearTimeout(timer); conversation.off('state',send); };
+    const cancelStream = () => { if (streamTimer !== null) clearTimeout(streamTimer); streamTimer = null; };
+    const publish = (_state, mode) => {
+      if (mode !== 'stream') { cancelStream(); send(conversation.snapshot()); return; }
+      if (streamTimer === null) streamTimer = setTimeout(() => { streamTimer = null; send(conversation.snapshot()); },50);
+    };
+    const cleanup = () => { clearTimeout(timer); cancelStream(); conversation.off('state',publish); };
     socket.on('error',cleanup); socket.on('close',cleanup);
     socket.on('message', raw => {
       if (authenticated || !authorized(raw.toString())) { socket.close(1008,'Invalid authentication'); return; }
-      authenticated = true; clearTimeout(timer); conversation.on('state',send); send(conversation.snapshot());
+      authenticated = true; clearTimeout(timer); conversation.on('state',publish); send(conversation.snapshot());
     });
   });
   if (staticRoot) await app.register(staticFiles,{root:resolve(staticRoot), index:['index.html']});

@@ -2,7 +2,7 @@
 
 Run npm install, npm run typecheck, npm test, then npm run dev. Open http://127.0.0.1:4317 (not localhost). Stop the backend with Ctrl+C. The frontend is built and served from the same origin, with no CORS or separate public Vite server. No model calls until you send a message.
 
-The current directory is the default workspace, and the default sandbox is read-only. Set PACC_WORKSPACE to a trusted repository path before starting; set PACC_WORKSPACE_WRITE=1 only if you intend to allow writes in that workspace. Codex enforces sandboxing; approvals may elevate individual operations, so inspect each request. Unsupported requests, permission grants, network approvals and policy amendments are rejected. Never expose this service to the internet or share the browser token. Existing Codex login is required.
+The current directory is the default workspace, and the default sandbox is read-only. Set PACC_WORKSPACE to a trusted repository path before starting; set PACC_WORKSPACE_WRITE=1 only if you intend to allow writes in that workspace. Codex enforces sandboxing; approvals may elevate individual operations, so inspect each request. Unsupported requests, actual additional permission grants, and network approvals are rejected with visible diagnostics. Optional command policy suggestions do not block one-time approval; PACC never accepts policy amendments or session-wide grants. Command previews may use the matching started item when the runtime omits the command in an approval request. Stream-only snapshots are coalesced over 50 ms; approvals, turn changes and completion are immediate. Never expose this service to the internet or share the browser token. Existing Codex login is required.
 
 PowerShell example:
 
