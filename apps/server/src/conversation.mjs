@@ -13,7 +13,7 @@ export class Conversation extends EventEmitter {
     this.connected = false; this.threadId = null; this.turnId = null;
     this.status = 'connecting'; this.startedAt = null; this.endedAt = null;
     this.messages = []; this.queue = []; this.models = []; this.pending = new Map();
-    this.early = []; this.error = null; this.items = new Map();
+    this.early = []; this.error = null; this.items = new Map(); this.fileChanges = new Map();
     this.client.on('notification', n => this.onEvent(n));
     this.client.on('disconnect', () => {
       this.connected = false; this.status = 'disconnected'; this.endedAt = Date.now();
@@ -66,7 +66,7 @@ export class Conversation extends EventEmitter {
   }
   async start(message) {
     this.status = 'starting'; this.error = null; this.turnId = null; this.early = [];
-    this.startedAt = Date.now(); this.endedAt = null; this.items.clear();
+    this.startedAt = Date.now(); this.endedAt = null; this.items.clear(); this.fileChanges.clear();
     this.messages.push({ id: randomUUID(), kind: 'user', text: message.text }); this.emitState();
     try {
       if (!this.threadId) {
@@ -83,8 +83,8 @@ export class Conversation extends EventEmitter {
       if (typeof result?.turn?.id !== 'string') throw new Error('Missing turn ID');
       this.turnId = result.turn.id; this.status = 'running';
       const events = this.early; this.early = [];
-      for (const e of events) this.onEvent(e);
-      if (this.turnId && terminal.has(result.turn.status)) this.finish(result.turn.status);
+      for (const e of events) { if (this.turnId !== result.turn.id) break; this.onEvent(e); }
+      if (this.turnId === result.turn.id && terminal.has(result.turn.status)) this.finish(result.turn.status);
       this.emitState();
     } catch (error) {
       if (!this.connected) return;
@@ -95,6 +95,10 @@ export class Conversation extends EventEmitter {
   onEvent(event) {
     const { method, params: p } = event;
     if (p?.threadId !== this.threadId || !this.active()) return;
+    if (method === 'serverRequest/resolved') {
+      for (const [id, pending] of this.pending) if (pending.requestId === p.requestId) this.resolveApproval(id,'decline');
+      return;
+    }
     if (!this.turnId) {
       if (this.early.length >= 10000) { this.client.close(); return; }
       this.early.push(event); return;
@@ -119,6 +123,7 @@ export class Conversation extends EventEmitter {
         record.text = bounded(item.text);
       } else if (allowedTools.has(item.type)) {
         const key = this.turnId + ':' + item.id + ':tool';
+        if (item.type === 'fileChange' && method === 'item/started') this.fileChanges.set(key, JSON.stringify(item,null,2));
         let record = this.items.get(key);
         if (!record) { record = { id:key,kind:'tool',text:item.type,startedAt:Date.now() }; this.items.set(key,record); this.messages.push(record); }
         record.text = bounded(JSON.stringify(item, null, 2)); record.label = item.type;
@@ -152,22 +157,22 @@ export class Conversation extends EventEmitter {
     this.messages.push({ id:randomUUID(),kind:'user',text,label:'Steered' }); this.emitState();
   }
   removeQueued(id) { this.queue = this.queue.filter(m => m.id !== id); this.emitState(); }
-  requestApproval({ method, params }) {
+  requestApproval({ id:requestId, method, params }) {
     if (!approvals.has(method) || !params || typeof params.turnId !== 'string' || params.threadId !== this.threadId || !this.active() || this.status === 'stopping' || (this.turnId && params.turnId !== this.turnId)) return Promise.reject(new Error('Unsupported request'));
     // No session-wide grants, network approvals, or policy amendments in this milestone.
     const decisions = params.availableDecisions;
     const command = typeof params.command === 'string' && params.command.trim();
-    const fileItem = this.items.get(params.turnId + ':' + params.itemId + ':tool');
+    const fileItem = this.fileChanges.get(params.turnId + ':' + params.itemId + ':tool');
     // Early item events may be buffered until turn/start is acknowledged.
-    const earlyFile = this.early.find(e => e.method === 'item/started' && e.params?.item?.id === params.itemId && e.params?.item?.type === 'fileChange');
-    const details = method.includes('fileChange') ? (fileItem?.text || (earlyFile && JSON.stringify(earlyFile.params.item,null,2))) : null;
-    if (params.networkApprovalContext || params.additionalPermissions || params.proposedExecpolicyAmendment || params.grantRoot ||
+    const earlyFile = this.early.find(e => e.method === 'item/started' && e.params?.turnId === params.turnId && e.params?.item?.id === params.itemId && e.params?.item?.type === 'fileChange');
+    const details = method.includes('fileChange') ? (fileItem || (earlyFile && JSON.stringify(earlyFile.params.item,null,2))) : null;
+    if (JSON.stringify(params).length > 100_000 || (details && details.length > 100_000) || params.networkApprovalContext || params.additionalPermissions || params.proposedExecpolicyAmendment || params.grantRoot ||
         (method.includes('commandExecution') && !command) || (method.includes('fileChange') && !details) ||
         (Array.isArray(decisions) && !decisions.includes('accept'))) return Promise.resolve({ decision:'decline' });
     const id = randomUUID();
     return new Promise(resolve => {
       const timer = setTimeout(() => this.resolveApproval(id,'decline'), 300_000);
-      this.pending.set(id,{ resolve,timer,turnId:params.turnId,publicData:{ id,method,details:JSON.stringify({ request:params, fileChange:details },null,2) } });
+      this.pending.set(id,{ resolve,timer,requestId,turnId:params.turnId,publicData:{ id,method,details:JSON.stringify({ request:params, fileChange:details },null,2) } });
       this.emitState();
     });
   }

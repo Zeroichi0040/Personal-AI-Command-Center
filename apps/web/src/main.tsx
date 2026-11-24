@@ -54,7 +54,7 @@ function App(){
   const disabled=!online||!state?.connected||state?.status==='uncertain'||busy;
   const selected=state?.models.find(m=>m.model===model);
   async function submit(){
-    if(!draft.trim()||disabled)return;
+    if(!draft.trim()||disabled||(active&&mode==='steer'&&!state?.turnReady))return;
     const text=draft;const ok=await action({action:active&&mode==='steer'?'steer':'send',text,model,effort});
     if(ok)setDraft(current=>current===text?'':current);
   }
@@ -65,7 +65,7 @@ function App(){
       <div className="scroll" ref={scroll} onScroll={()=>{const e=scroll.current;if(e)follow.current=e.scrollHeight-e.scrollTop-e.clientHeight<100;}}>
         {state?.messages.length===0&&<div className="empty"><div className="terminal-mark">&gt;_</div><h1>What are we building?</h1><p>Ask Codex to inspect your workspace, plan changes, or help debug an issue.</p></div>}
         {state?.messages.map(m=>m.kind==='tool'||m.kind==='reasoning'?<details className="activity" key={m.id}><summary>{m.kind==='reasoning'?'Reasoning summary':m.label||'Tool activity'} {m.endedAt&&m.startedAt?'· '+duration(m.endedAt-m.startedAt):''}</summary><pre>{m.text}</pre></details>:<article key={m.id} className={'message '+m.kind}><div className="author">{m.kind==='user'?'You': 'Codex'}{m.label?' · '+m.label:''}</div>{m.kind==='user'?<div className="usertext">{m.text}</div>:<Markdown skipHtml remarkPlugins={[remarkGfm]} components={{code:Code,a:({children})=><span>{children}</span>,img:()=>null}}>{m.text}</Markdown>}</article>)}
-        {state?.approvals.map(a=><section key={a.id} className="approval"><strong>Approval requested · {a.method.includes('fileChange')?'File change':'Command execution'}</strong><p>This may allow an operation outside the normal sandbox. Review the full request before approving.</p><pre>{a.details}</pre><div className="actions"><button disabled={disabled} onClick={()=>void action({action:'approval',id:a.id,decision:'decline'})}>Decline</button><button className="primary" disabled={disabled||!state.turnReady} onClick={()=>void action({action:'approval',id:a.id,decision:'accept'})}>Approve once</button></div></section>)}
+        {state?.approvals.map(a=><section key={a.id} className="approval"><strong>Approval requested · {a.method.includes('fileChange')?'File change':'Command execution'}</strong><p>This may allow an operation outside the normal sandbox. Review the full request before approving.</p><pre>{a.details}</pre><div className="actions"><button disabled={disabled} onClick={()=>void action({action:'approval',id:a.id,decision:'decline'})}>Decline</button><button className="primary" disabled={disabled||!state?.turnReady} onClick={()=>void action({action:'approval',id:a.id,decision:'accept'})}>Approve once</button></div></section>)}
       </div>
       <div className="composer-wrap">
         {(error||state?.error)&&<div className="error" role="alert">{error||state?.error}</div>}

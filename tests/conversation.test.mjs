@@ -62,7 +62,15 @@ test('HTTP validates host, origin and token; only allowlisted actions',async t=>
   assert.equal((await app.inject({url:'/api/bootstrap',headers:{host:'evil.example'}})).statusCode,403);
   const post=(headers,payload)=>app.inject({method:'POST',url:'/api/action',headers:{host,...headers},payload});
   assert.equal((await post({origin},{action:'send',text:'hi'})).statusCode,403);
+  assert.equal((await post({origin,'x-pacc-token':'é'.repeat(64)},{action:'send',text:'hi'})).statusCode,403);
   assert.equal((await post({origin:'https://evil.example','x-pacc-token':token},{action:'send',text:'hi'})).statusCode,403);
   assert.equal((await post({origin,'x-pacc-token':token},{action:'command/exec'})).statusCode,400);
   assert.equal((await post({origin,'x-pacc-token':token},{action:'send',text:'hi'})).statusCode,200);assert.equal(client.n,1);
+});
+
+test('server-resolved approvals cannot be accepted later',async()=>{
+  const {c,client}=await setup();await c.send({text:'first'});
+  const p=c.requestApproval({id:123,method:'item/commandExecution/requestApproval',params:{threadId:'thread',turnId:'turn1',command:'echo x'}});
+  const id=c.snapshot().approvals[0].id;client.emit('notification',{method:'serverRequest/resolved',params:{threadId:'thread',requestId:123}});
+  assert.deepEqual(await p,{decision:'decline'});assert.throws(()=>c.resolveApproval(id,'accept'));
 });

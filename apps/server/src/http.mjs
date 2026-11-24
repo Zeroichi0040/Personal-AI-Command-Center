@@ -9,7 +9,7 @@ export async function buildServer(conversation, { port = 4317, staticRoot } = {}
   const host = '127.0.0.1:' + port;
   const origin = 'http://' + host;
   const token = randomBytes(32).toString('hex');
-  const authorized = value => typeof value === 'string' && value.length === token.length && timingSafeEqual(Buffer.from(value,'utf8'),Buffer.from(token,'utf8'));
+  const authorized = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) && timingSafeEqual(Buffer.from(value,'utf8'),Buffer.from(token,'utf8'));
   await app.register(websocket, { options:{ maxPayload:1024 } });
   app.addHook('onRequest', async (req, reply) => {
     // Exact Host blocks DNS rebinding. Browser mutations and sockets additionally require exact origin.
