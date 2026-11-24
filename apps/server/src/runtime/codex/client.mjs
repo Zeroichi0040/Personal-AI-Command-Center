@@ -5,10 +5,11 @@ import { createInterface } from 'node:readline';
 // Minimal transport spike. No shell, credential handling, retries or browser API.
 export class CodexClient extends EventEmitter {
   #proc; #pending = new Map(); #next = 1; #closed = false;
-  #ready = false; #initializing = false; #lines;
-  constructor({ executable = process.env.CODEX_EXECUTABLE || 'codex', args = ['app-server'], timeoutMs = 30_000 } = {}) {
+  #ready = false; #initializing = false; #lines; #serverRequest;
+  constructor({ executable = process.env.CODEX_EXECUTABLE || 'codex', args = ['app-server'], timeoutMs = 30_000, serverRequest } = {}) {
     super();
     this.timeoutMs = timeoutMs;
+    this.#serverRequest = serverRequest;
     this.#proc = spawn(executable, args, { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     this.#lines = createInterface({ input: this.#proc.stdout, crlfDelay: Infinity });
     this.#lines.on('line', line => this.#receive(line));
@@ -40,8 +41,15 @@ export class CodexClient extends EventEmitter {
       if (Object.hasOwn(message, 'id')) {
         // Milestone 1 intentionally cannot approve tools, write access or user input.
         // Do not log server request parameters; they may contain private data.
-        try { this.#write({ id: message.id, error: { code: -32601, message: 'Server requests are not supported by the read-only smoke client' } }); }
-        catch (error) { this.#fail(error); }
+        if (this.#serverRequest) {
+          Promise.resolve().then(() => this.#serverRequest(message)).then(
+            result => { if (!this.#closed) this.#write({ id: message.id, result }); },
+            () => { if (!this.#closed) this.#write({ id: message.id, error: { code: -32601, message: 'Unsupported or cancelled server request' } }); }
+          ).catch(error => this.#fail(error));
+        } else {
+          try { this.#write({ id: message.id, error: { code: -32601, message: 'Server requests are not supported by the read-only smoke client' } }); }
+          catch (error) { this.#fail(error); }
+        }
       } else { this.emit('notification', message); }
       return;
     }

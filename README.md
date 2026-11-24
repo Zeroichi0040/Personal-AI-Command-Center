@@ -2,15 +2,19 @@
 
 A local-first, personal AI development environment. The first release targets Codex; other runtimes are planned later.
 
-## Status: Milestone 1 — runtime validation (pre-release)
+## Status: Milestone 2 — core client preview (pre-release)
 
-This is a dependency-free protocol spike, not yet the web application. It validates the App Server handshake, existing ChatGPT account detection, and an opt-in two-turn native thread resume workflow. JavaScript ES modules keep the initial compatibility test independent of build tools; the typed application adapter and UI follow once the real runtime is verified.
+Start the browser client with `npm install` followed by `npm run dev`, then open http://127.0.0.1:4317. See [client setup and limitations](docs/client.md). The runtime smoke tests below remain available.
+
+## Runtime foundation
+
+The original dependency-free protocol spike remains available. It validates the App Server handshake, existing ChatGPT account detection, and an opt-in two-turn native thread resume workflow. JavaScript ES modules keep the initial compatibility test independent of build tools; the browser client builds on that transport.
 
 ## Requirements
 
 - Node.js 22 or newer
 - Codex CLI installed locally and signed in using ChatGPT (`codex login`)
-- Windows or Linux (Windows CI configured but not yet run)
+- Windows or Linux (Windows runtime smoke verified in Milestone 1)
 
 Run from this directory:
 
@@ -39,6 +43,6 @@ On Linux, set `CODEX_EXECUTABLE` to the absolute executable path if necessary.
 
 ## Testing
 
-The mock server runs offline and consumes no model credits. It exercises handshake, errors, unsupported server requests, out-of-order events, timeouts and disconnects. Mock recall is a fixture, not proof of actual model memory. GitHub Actions is configured for Windows and Linux. Live authentication and recall must be verified locally before proceeding to the application UI.
+The mock server runs offline and consumes no model credits. It exercises handshake, errors, unsupported server requests, out-of-order events, timeouts and disconnects. Mock recall is a fixture, not proof of actual model memory. GitHub Actions is configured for Windows and Linux. Live authentication and recall were verified by the repository owner on Windows with Codex CLI 0.171.0. The new browser workflow still needs live verification.
 
 See [roadmap](docs/roadmap.md) and the [official App Server protocol](https://learn.chatgpt.com/docs/app-server).
