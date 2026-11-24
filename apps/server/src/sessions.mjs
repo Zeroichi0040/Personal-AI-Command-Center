@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { basename } from 'node:path';
 import * as git from './workspaces.mjs';
+import { TaskBook } from './tasks.mjs';
 
 const modes=new Set(['read-only','existing','isolated']);
 const occupied=s=>s.conversation.active()||s.conversation.status==='uncertain';
@@ -19,7 +20,7 @@ const label=(value,fallback)=>{if(value==null||value==='')return fallback;if(typ
 export class SessionManager extends EventEmitter {
   constructor({createSession,workspace=git,maxActive=2,store=null}) {
     super();this.createSession=createSession;this.workspace=workspace;this.maxActive=maxActive;
-    this.projects=new Map();this.sessions=new Map();this.creating=new Map();this.closed=false;this.store=store;this.saveTimer=null;this.storageError=null;
+    this.projects=new Map();this.sessions=new Map();this.creating=new Map();this.closed=false;this.store=store;this.saveTimer=null;this.storageError=null;this.tasks=new TaskBook();
   }
   records(){
     return [...this.sessions.values()].map(s=>({id:s.id,projectId:s.projectId,name:s.name,mode:s.mode,cwd:s.cwd,writable:s.writable,branch:s.branch,worktreeBranch:s.worktreeBranch??(s.mode==='isolated'?s.branch:null),git:s.git,autoName:!!s.autoName,preferences:s.preferences||{},saved:s.conversation instanceof OfflineConversation?s.conversation.saved:savedState(s.conversation)}));
@@ -27,7 +28,7 @@ export class SessionManager extends EventEmitter {
   flush(){
     if(this.saveTimer!==null){clearTimeout(this.saveTimer);this.saveTimer=null;}
     if(!this.store)return;
-    try{this.store.save([...this.projects.values()],this.records());this.storageError=null;}
+    try{this.store.save([...this.projects.values()],this.records(),this.tasks.list());this.storageError=null;}
     catch(e){this.storageError='Local storage failed: '+e.message;throw e;}
   }
   emitState(mode='immediate'){
@@ -41,6 +42,7 @@ export class SessionManager extends EventEmitter {
   restore(){
     if(!this.store)return false;
     const data=this.store.load();
+    this.tasks.load(data.tasks);
     for(const p of data.projects)this.projects.set(p.id,p);
     for(const r of data.sessions){
       const interrupted=['starting','running','stopping','uncertain'].includes(r.saved.status);
@@ -73,7 +75,7 @@ export class SessionManager extends EventEmitter {
       if(this.closed)throw Error('Manager closed');
       s.conversation.off('state',s.listener);s.close();
       s.conversation=runtime.conversation;s.close=runtime.close;s.interrupted=false;
-      s.listener=(_state,mode)=>this.emitState(mode);
+      s.listener=(_state,mode)=>{this.tasks.observe(s.id,s.conversation.status);this.emitState(mode);};
       s.conversation.checkpoint=()=>this.flush();
       s.conversation.on('state',s.listener);
     }catch(error){
@@ -83,7 +85,7 @@ export class SessionManager extends EventEmitter {
     }finally{s.reconnecting=false;if(!this.closed)this.emitState();}
   }
   snapshot(){
-    return {projects:[...this.projects.values()],sessions:[...this.sessions.values()].map(s=>({id:s.id,projectId:s.projectId,name:s.name,mode:s.mode,branch:s.branch,git:s.git,preferences:s.preferences||{},reconnecting:!!s.reconnecting,interrupted:!!s.interrupted,conversation:s.conversation.snapshot()})),storageError:this.storageError,activeCount:this.activeCount(),maxActive:this.maxActive};
+    return {tasks:this.tasks.list(),projects:[...this.projects.values()],sessions:[...this.sessions.values()].map(s=>({id:s.id,projectId:s.projectId,name:s.name,mode:s.mode,branch:s.branch,git:s.git,preferences:s.preferences||{},reconnecting:!!s.reconnecting,interrupted:!!s.interrupted,conversation:s.conversation.snapshot()})),storageError:this.storageError,activeCount:this.activeCount(),maxActive:this.maxActive};
   }
   activeCount(){return [...this.sessions.values()].filter(occupied).length;}
   project(id){const p=this.projects.get(id);if(!p)throw Error('Unknown project');return p;}
@@ -99,7 +101,7 @@ export class SessionManager extends EventEmitter {
     const id=randomUUID();this.projects.set(id,{id,root,name:label(name,basename(root)||root)});this.emitState();return id;
   }
   renameProject(id,name){const p=this.project(id);p.name=label(name,p.name);this.emitState();}
-  removeProject(id){this.project(id);if([...this.sessions.values(),...this.creating.values()].some(s=>s.projectId===id))throw Error('Close the project sessions before removing it');this.projects.delete(id);this.emitState();}
+  removeProject(id){this.project(id);if(this.tasks.list().some(t=>t.projectId===id))throw Error('Remove project tasks before removing the project');if([...this.sessions.values(),...this.creating.values()].some(s=>s.projectId===id))throw Error('Close the project sessions before removing it');this.projects.delete(id);this.emitState();}
   async addSession(projectId,name,mode='read-only'){
     if(this.closed)throw Error('Manager is closed');
     const project=this.project(projectId);
@@ -122,7 +124,7 @@ export class SessionManager extends EventEmitter {
       if(this.closed)throw Error('Manager is closed');
       const s={...pending,name:sessionName,mode,branch:location.branch,worktreeBranch:location.branch,git:null,conversation,close:runtime.close,autoName:!name,preferences:{}};
       // Initialization is complete before exposing the session to actions.
-      const listener=(_state,eventMode)=>this.emitState(eventMode);
+      const listener=(_state,eventMode)=>{this.tasks.observe(id,conversation.status);this.emitState(eventMode);};
       s.listener=listener;conversation.checkpoint=()=>this.flush();conversation.on('state',listener);
       this.sessions.set(id,s);this.emitState();return id;
     }catch(error){
@@ -132,10 +134,48 @@ export class SessionManager extends EventEmitter {
     }finally{this.creating.delete(id);}
   }
   renameSession(id,name){const s=this.session(id);s.name=label(name,s.name);s.autoName=false;this.emitState();}
-  closeSession(id){const s=this.session(id);if(occupied(s)||s.reconnecting)throw Error('Stop active work first; uncertain sessions require a server restart');s.conversation.off('state',s.listener);this.sessions.delete(id);s.close();this.emitState();}
+  closeSession(id){const s=this.session(id);if(occupied(s)||s.reconnecting)throw Error('Stop active work first; uncertain sessions require a server restart');s.conversation.off('state',s.listener);this.sessions.delete(id);s.close();for(const t of this.tasks.list())if(t.sessionId===id)this.tasks.assign(t,null);this.emitState();}
+  commitTasks(fn){
+    const before=structuredClone(this.tasks.list());
+    try{const value=fn();this.flush();this.emit('state',null,'immediate');return value;}
+    catch(error){this.tasks.tasks=new Map(before.map(t=>[t.id,t]));this.emit('state',null,'immediate');throw error;}
+  }
+  async dispatchTask(taskId){
+    const t=this.tasks.get(taskId);
+    if(!t.sessionId)throw Error('Assign a session first');
+    const s=this.session(t.sessionId),c=s.conversation;
+    if(s.projectId!==t.projectId)throw Error('Task and session must share a project');
+    if(!c.snapshot().connected||s.reconnecting||occupied(s)||this.tasks.forSession(s.id))throw Error('Choose an idle connected session');
+    if(this.activeCount()>=this.maxActive)throw Error('All generation slots are occupied');
+    const data={text:this.tasks.prompt(t),model:s.preferences?.model||'',effort:s.preferences?.effort||''};
+    c.validateMessage?.(data);
+    this.commitTasks(()=>this.tasks.begin(t,s.id));
+    try{
+      // No await between reserving the attempt and sending; normal chat cannot queue behind it.
+      await c.send(data);
+      this.tasks.observe(s.id,c.status);
+      this.emitState();
+    }catch(error){
+      this.tasks.finish(t,'uncertain',error.message);this.emitState();throw error;
+    }
+  }
   async dispatch(data){
     if(this.closed)throw Error('Manager is closed');
     if(this.storageError&&(['send','steer','createSession','reconnect'].includes(data?.action)||(data?.action==='approval'&&data.decision==='accept')))throw Error(this.storageError);
+    if(typeof data?.action==='string'&&['createTask','editTask','assignTask','moveTask','deleteTask','dispatchTask'].includes(data.action)){
+      if(this.storageError)throw Error(this.storageError);
+      if(data.action==='createTask'){this.project(data.projectId);return {taskId:this.commitTasks(()=>this.tasks.create(data.projectId,data)).id};}
+      const t=this.tasks.get(data.taskId);
+      if(data.action==='dispatchTask'){await this.dispatchTask(t.id);return {};}
+      this.commitTasks(()=>{
+        switch(data.action){
+          case 'editTask':this.tasks.edit(t,data);break;
+          case 'assignTask':{const id=data.assignedSessionId||null;if(id&&this.session(id).projectId!==t.projectId)throw Error('Task and session must share a project');this.tasks.assign(t,id);break;}
+          case 'moveTask':this.tasks.move(t,data.status);break;
+          case 'deleteTask':this.tasks.remove(t);break;
+        }
+      });return {};
+    }
     switch(data?.action){
       case 'registerProject':return {projectId:await this.register(data.path,data.name)};
       case 'renameProject':this.renameProject(data.projectId,data.name);return {};
@@ -150,6 +190,7 @@ export class SessionManager extends EventEmitter {
     const s=this.session(data?.sessionId),c=s.conversation;
     switch(data.action){
       case 'send':
+        if(this.tasks.forSession(s.id))throw Error('A task is executing in this session; wait or use Steer');
         // Conversation.send synchronously enters starting before its first await.
         // Queued follow-ups reuse the already occupied slot.
         if(!c.active()&&this.activeCount()>=this.maxActive)throw Error('All generation slots are occupied; wait or stop another session');
