@@ -79,7 +79,7 @@ export class CodexClient extends EventEmitter {
     if (this.#ready || this.#initializing) throw new Error('Already initialized or initializing');
     this.#initializing = true;
     try {
-      const info = await this.#request('initialize', { clientInfo: { name: 'personal_ai_command_center', title: 'Personal AI Command Center', version: '0.1.0-dev.1' } });
+      const info = await this.#request('initialize', { clientInfo: { name: 'personal_ai_command_center', title: 'Personal AI Command Center', version: '0.1.0-rc.1' } });
       this.#write({ method: 'initialized' });
       this.#ready = true; return info;
     } catch (error) { this.#fail(error); throw error; }

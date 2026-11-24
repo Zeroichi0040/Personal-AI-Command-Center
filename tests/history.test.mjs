@@ -1,10 +1,11 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,rm} from 'node:fs/promises';
+import {mkdtemp,rm,stat} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {EventEmitter} from 'node:events';
-import {HistoryStore} from '../apps/server/src/history.mjs';
+import { DatabaseSync } from 'node:sqlite';
+import {HistoryStore,SCHEMA_VERSION} from '../apps/server/src/history.mjs';
 import {SessionManager} from '../apps/server/src/sessions.mjs';
 import {Conversation} from '../apps/server/src/conversation.mjs';
 
@@ -65,4 +66,31 @@ test('failed checkpoint prevents dispatching a model turn',async()=>{
   c.checkpoint=()=>{if(c.threadId)throw Error('database unavailable');};
   await c.send({text:'do not replay'});
   assert.equal(c.status,'uncertain');assert.equal(client.calls.includes('turn/start'),false);
+});
+
+test('legacy schema migration backs up data and future schema fails closed',async t=>{
+  const dir=await mkdtemp(join(tmpdir(),'pacc-migrate-'));t.after(()=>rm(dir,{recursive:true,force:true}));
+  const path=join(dir,'history.sqlite');
+  let store=new HistoryStore(path);
+  store.save([{id:'p',name:'legacy'}],[{id:'s',saved:{messages:[{id:'m',text:'legacy codeword'}]}}]);store.db.exec('PRAGMA user_version=0');store.close();
+  store=new HistoryStore(path);
+  try{
+    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version,SCHEMA_VERSION);
+    assert.ok(await stat(store.migrationBackup));
+    const backup=new DatabaseSync(store.migrationBackup,{readOnly:true});
+    try{assert.equal(backup.prepare('PRAGMA user_version').get().user_version,0);assert.equal(backup.prepare('SELECT count(*) AS n FROM sessions').get().n,1);}finally{backup.close();}
+    const manual=store.backup();assert.ok(await stat(manual));
+    assert.equal(store.search('legacy')[0].messageId,'m');
+    store.db.exec('PRAGMA user_version=999');
+  }finally{store.close();}
+  assert.throws(()=>new HistoryStore(path),/newer PACC/);
+});
+test('incremental FTS updates changed message and removes deleted message',()=>{
+  const store=new HistoryStore(':memory:');
+  try{
+    const s={id:'s',saved:{messages:[{id:'a',text:'alpha'},{id:'b',text:'beta'}]}};
+    store.save([],[s]);s.saved.messages=[{id:'a',text:'gamma'}];store.save([],[s]);
+    assert.equal(store.search('alpha').length,0);assert.equal(store.search('beta').length,0);assert.equal(store.search('gamma').length,1);
+    store.save([],[s]);assert.equal(store.search('gamma').length,1);
+  }finally{store.close();}
 });
