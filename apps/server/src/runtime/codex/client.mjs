@@ -43,7 +43,7 @@ export class CodexClient extends EventEmitter {
         // Do not log server request parameters; they may contain private data.
         if (this.#serverRequest) {
           Promise.resolve().then(() => this.#serverRequest(message)).then(
-            result => { if (!this.#closed) this.#write({ id: message.id, result }); },
+            result => { if (!this.#closed && result !== undefined) this.#write({ id: message.id, result }); },
             () => { if (!this.#closed) this.#write({ id: message.id, error: { code: -32601, message: 'Unsupported or cancelled server request' } }); }
           ).catch(error => this.#fail(error));
         } else {

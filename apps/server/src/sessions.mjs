@@ -20,8 +20,10 @@ const label=(value,fallback)=>{if(value==null||value==='')return fallback;if(typ
 export class SessionManager extends EventEmitter {
   constructor({createSession,workspace=git,maxActive=2,store=null}) {
     super();this.createSession=createSession;this.workspace=workspace;this.maxActive=maxActive;
-    this.projects=new Map();this.sessions=new Map();this.creating=new Map();this.closed=false;this.store=store;this.saveTimer=null;this.storageError=null;this.tasks=new TaskBook();
+    this.projects=new Map();this.sessions=new Map();this.creating=new Map();this.closed=false;this.store=store;this.saveTimer=null;this.storageError=null;this.tasks=new TaskBook();this.inflight=new Set();
   }
+  checkWorkspace(s){this.workspace.assertCurrent?.(s.cwd);this.workspace.assertCurrent?.(this.project(s.projectId).root);}
+  checkpoint(s){this.checkWorkspace(s);this.flush();}
   records(){
     return [...this.sessions.values()].map(s=>({id:s.id,projectId:s.projectId,name:s.name,mode:s.mode,cwd:s.cwd,writable:s.writable,branch:s.branch,worktreeBranch:s.worktreeBranch??(s.mode==='isolated'?s.branch:null),git:s.git,autoName:!!s.autoName,preferences:s.preferences||{},saved:s.conversation instanceof OfflineConversation?s.conversation.saved:savedState(s.conversation)}));
   }
@@ -32,6 +34,7 @@ export class SessionManager extends EventEmitter {
     catch(e){this.storageError='Local storage failed: '+e.message;throw e;}
   }
   emitState(mode='immediate'){
+    if(this.closed)return;
     if(this.store){
       if(mode==='stream'){
         if(this.saveTimer===null)this.saveTimer=setTimeout(()=>{try{this.flush();}catch{this.emit('state',null,'immediate');}},250);
@@ -70,19 +73,20 @@ export class SessionManager extends EventEmitter {
       }
       if(s.writable&&[...this.sessions.values(),...this.creating.values()].some(other=>other.id!==id&&other.writable&&other.cwd&&this.workspace.overlaps(other.cwd,cwd)))throw Error('Writable workspace conflicts with another session');
       if(this.closed)throw Error('Manager closed');
-      runtime=this.createSession({cwd,writable:s.writable});
+      runtime=this.createSession({cwd,writable:s.writable});this.inflight.add(runtime);
       await runtime.conversation.resume(saved);
       if(this.closed)throw Error('Manager closed');
       s.conversation.off('state',s.listener);s.close();
       s.conversation=runtime.conversation;s.close=runtime.close;s.interrupted=false;
       s.listener=(_state,mode)=>{this.tasks.observe(s.id,s.conversation.status);this.emitState(mode);};
-      s.conversation.checkpoint=()=>this.flush();
+      s.conversation.checkpoint=()=>this.checkpoint(s);
       s.conversation.on('state',s.listener);
     }catch(error){
       runtime?.close();
+      s.conversation.off('state',s.listener);s.close();
       s.conversation=new OfflineConversation(saved,s.cwd,s.writable,'Reconnect failed: '+error.message);
       s.close=()=>{};s.listener=()=>{};throw error;
-    }finally{s.reconnecting=false;if(!this.closed)this.emitState();}
+    }finally{if(runtime)this.inflight.delete(runtime);s.reconnecting=false;if(!this.closed)this.emitState();}
   }
   snapshot(){
     return {tasks:this.tasks.list(),projects:[...this.projects.values()],sessions:[...this.sessions.values()].map(s=>({id:s.id,projectId:s.projectId,name:s.name,mode:s.mode,branch:s.branch,git:s.git,preferences:s.preferences||{},reconnecting:!!s.reconnecting,interrupted:!!s.interrupted,conversation:s.conversation.snapshot()})),storageError:this.storageError,activeCount:this.activeCount(),maxActive:this.maxActive};
@@ -90,6 +94,7 @@ export class SessionManager extends EventEmitter {
   activeCount(){return [...this.sessions.values()].filter(occupied).length;}
   project(id){const p=this.projects.get(id);if(!p)throw Error('Unknown project');return p;}
   session(id){const s=this.sessions.get(id);if(!s)throw Error('Unknown session');return s;}
+  persistMetadata(rollback){try{this.flush();}catch(error){rollback();this.emit('state',null,'immediate');throw error;}this.emit('state',null,'immediate');}
   async register(path,name,{allowDirectory=false}={}){
     if(this.closed)throw Error('Manager is closed');
     let root;
@@ -98,13 +103,14 @@ export class SessionManager extends EventEmitter {
     if(this.closed)throw Error('Manager is closed');
     if([...this.projects.values()].some(p=>this.workspace.overlaps(p.root,root)&&this.workspace.overlaps(root,p.root)))throw Error('Project overlaps an already registered workspace');
     if(this.projects.size>=20)throw Error('Project limit reached');
-    const id=randomUUID();this.projects.set(id,{id,root,name:label(name,basename(root)||root)});this.emitState();return id;
+    const id=randomUUID();this.projects.set(id,{id,root,name:label(name,basename(root)||root)});this.persistMetadata(()=>this.projects.delete(id));return id;
   }
-  renameProject(id,name){const p=this.project(id);p.name=label(name,p.name);this.emitState();}
-  removeProject(id){this.project(id);if(this.tasks.list().some(t=>t.projectId===id))throw Error('Remove project tasks before removing the project');if([...this.sessions.values(),...this.creating.values()].some(s=>s.projectId===id))throw Error('Close the project sessions before removing it');this.projects.delete(id);this.emitState();}
+  renameProject(id,name){const p=this.project(id),old=p.name;p.name=label(name,p.name);this.persistMetadata(()=>{p.name=old;});}
+  removeProject(id){this.project(id);if(this.tasks.list().some(t=>t.projectId===id))throw Error('Remove project tasks before removing the project');if([...this.sessions.values(),...this.creating.values()].some(s=>s.projectId===id))throw Error('Close the project sessions before removing it');const old=this.project(id);this.projects.delete(id);this.persistMetadata(()=>this.projects.set(id,old));}
   async addSession(projectId,name,mode='read-only'){
     if(this.closed)throw Error('Manager is closed');
     const project=this.project(projectId);
+    this.workspace.assertCurrent?.(project.root);
     if(!modes.has(mode))throw Error('Unknown workspace mode');
     if(this.sessions.size+this.creating.size>=12)throw Error('Session limit reached (12)');
     const id=randomUUID(),writable=mode!=='read-only';
@@ -118,23 +124,25 @@ export class SessionManager extends EventEmitter {
       if(this.closed)throw Error('Manager is closed');
       pending.cwd=location.cwd;
       if(writable&&[...this.sessions.values(),...this.creating.values()].some(s=>s.id!==id&&s.writable&&s.cwd&&this.workspace.overlaps(s.cwd,location.cwd)))throw Error('Writable workspace conflicts with another session');
-      runtime=this.createSession({cwd:location.cwd,writable});
+      runtime=this.createSession({cwd:location.cwd,writable});this.inflight.add(runtime);
       const conversation=runtime.conversation;
       await conversation.initialize();
       if(this.closed)throw Error('Manager is closed');
       const s={...pending,name:sessionName,mode,branch:location.branch,worktreeBranch:location.branch,git:null,conversation,close:runtime.close,autoName:!name,preferences:{}};
       // Initialization is complete before exposing the session to actions.
       const listener=(_state,eventMode)=>{this.tasks.observe(id,conversation.status);this.emitState(eventMode);};
-      s.listener=listener;conversation.checkpoint=()=>this.flush();conversation.on('state',listener);
-      this.sessions.set(id,s);this.emitState();return id;
+      s.listener=listener;conversation.checkpoint=()=>this.checkpoint(s);conversation.on('state',listener);
+      this.sessions.set(id,s);
+      try{this.flush();}catch(error){this.sessions.delete(id);conversation.off('state',listener);throw error;}
+      this.emit('state',null,'immediate');return id;
     }catch(error){
       runtime?.close();
       if(mode==='isolated'&&location)throw Error(error.message+'; worktree preserved at '+location.cwd);
       throw error;
-    }finally{this.creating.delete(id);}
+    }finally{if(runtime)this.inflight.delete(runtime);this.creating.delete(id);}
   }
-  renameSession(id,name){const s=this.session(id);s.name=label(name,s.name);s.autoName=false;this.emitState();}
-  closeSession(id){const s=this.session(id);if(occupied(s)||s.reconnecting)throw Error('Stop active work first; uncertain sessions require a server restart');s.conversation.off('state',s.listener);this.sessions.delete(id);s.close();for(const t of this.tasks.list())if(t.sessionId===id)this.tasks.assign(t,null);this.emitState();}
+  renameSession(id,name){const s=this.session(id),old={name:s.name,autoName:s.autoName};s.name=label(name,s.name);s.autoName=false;this.persistMetadata(()=>Object.assign(s,old));}
+  closeSession(id){const s=this.session(id);if(occupied(s)||s.reconnecting)throw Error('Stop active work first; uncertain sessions require a server restart');const before=structuredClone(this.tasks.list());this.sessions.delete(id);for(const t of this.tasks.list())if(t.sessionId===id)this.tasks.assign(t,null);this.persistMetadata(()=>{this.sessions.set(id,s);this.tasks.tasks=new Map(before.map(t=>[t.id,t]));});s.conversation.off('state',s.listener);s.close();}
   commitTasks(fn){
     const before=structuredClone(this.tasks.list());
     try{const value=fn();this.flush();this.emit('state',null,'immediate');return value;}
@@ -147,16 +155,19 @@ export class SessionManager extends EventEmitter {
     if(s.projectId!==t.projectId)throw Error('Task and session must share a project');
     if(!c.snapshot().connected||s.reconnecting||occupied(s)||this.tasks.forSession(s.id))throw Error('Choose an idle connected session');
     if(this.activeCount()>=this.maxActive)throw Error('All generation slots are occupied');
+    this.checkWorkspace(s);
     const data={text:this.tasks.prompt(t),model:s.preferences?.model||'',effort:s.preferences?.effort||''};
     c.validateMessage?.(data);
-    this.commitTasks(()=>this.tasks.begin(t,s.id));
+    const attempt=this.commitTasks(()=>this.tasks.begin(t,s.id));
     try{
       // No await between reserving the attempt and sending; normal chat cannot queue behind it.
       await c.send(data);
-      this.tasks.observe(s.id,c.status);
-      this.emitState();
+      if(this.tasks.tasks.get(t.id)?.activeAttempt?.id===attempt.id)this.tasks.observe(s.id,c.status);
+      if(!this.closed)this.emitState();
     }catch(error){
-      this.tasks.finish(t,'uncertain',error.message);this.emitState();throw error;
+      const current=this.tasks.tasks.get(t.id);
+      if(current?.activeAttempt?.id===attempt.id)this.tasks.finish(current,'uncertain',error.message);
+      if(!this.closed)this.emitState();throw error;
     }
   }
   async dispatch(data){
@@ -184,6 +195,7 @@ export class SessionManager extends EventEmitter {
       case 'renameSession':this.renameSession(data.sessionId,data.name);return {};
       case 'closeSession':this.closeSession(data.sessionId);return {};
       case 'reconnect':await this.reconnect(data.sessionId,data.acknowledge===true);return {};
+      case 'backupHistory':this.flush();if(!this.store)throw Error('History storage unavailable');return {backupPath:this.store.backup()};
       case 'searchHistory':this.flush();return {results:this.store?.search(data.query)||[]};
       case 'exportSession':{const s=this.session(data.sessionId);return {export:{name:s.name,project:this.project(s.projectId).name,workspace:s.cwd,...savedState(s.conversation)}};}
     }
@@ -195,17 +207,19 @@ export class SessionManager extends EventEmitter {
         // Queued follow-ups reuse the already occupied slot.
         if(!c.active()&&this.activeCount()>=this.maxActive)throw Error('All generation slots are occupied; wait or stop another session');
         if(c instanceof OfflineConversation)throw Error('Reconnect the saved session first');
+        this.checkWorkspace(s);
         if(typeof c.validateMessage==='function')c.validateMessage(data);
         if(s.autoName&&typeof data.text==='string'&&data.text.trim()){s.name=data.text.trim().replace(/\s+/g,' ').slice(0,60);s.autoName=false;}
         s.preferences={model:data.model||'',effort:data.effort||''};
         await c.send(data);break;
       case 'stop':await c.stop();break;
-      case 'steer':await c.steer(data);break;
+      case 'steer':this.checkWorkspace(s);await c.steer(data);break;
       case 'removeQueued':c.removeQueued(data.id);break;
       case 'approval':{
         // Approval can escape normal sandbox boundaries. Do not elevate while
         // another writable reservation overlaps this session's workspace.
         if(data.decision==='accept'&&[...this.sessions.values(),...this.creating.values()].some(other=>other.id!==s.id&&other.writable&&other.cwd&&this.workspace.overlaps(other.cwd,s.cwd)))throw Error('Approval blocked by overlapping writable workspace; decline or close the other session');
+        if(data.decision==='accept')this.checkWorkspace(s);
         c.resolveApproval(data.id,data.decision);break;
       }
       case 'inspectGit':{
@@ -216,5 +230,5 @@ export class SessionManager extends EventEmitter {
     }
     return {};
   }
-  close({persist=true}={}){this.closed=true;try{if(persist)this.flush();}finally{for(const s of this.sessions.values()){s.conversation.off('state',s.listener);s.close();}this.sessions.clear();this.store?.close();}}
+  close({persist=true}={}){if(this.closed)return;this.closed=true;try{if(persist)this.flush();}finally{if(this.saveTimer!==null)clearTimeout(this.saveTimer);for(const runtime of this.inflight)runtime.close();this.inflight.clear();for(const s of this.sessions.values()){s.conversation.off('state',s.listener);s.close();}this.sessions.clear();this.store?.close();}}
 }

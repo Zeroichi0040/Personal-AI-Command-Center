@@ -46,7 +46,7 @@ export class Conversation extends EventEmitter {
     if (account?.type !== 'chatgpt') throw new Error('Sign in using ChatGPT with codex login first');
     this.connected = true; this.status = 'idle';
     try {
-      let cursor = null;
+      let cursor = null;const seen=new Set();let pages=0;
       do {
         const page = await this.client.request('model/list', { limit: 100, includeHidden: false, ...(cursor ? { cursor } : {}) });
         if (!Array.isArray(page.data)) break;
@@ -55,7 +55,9 @@ export class Conversation extends EventEmitter {
           efforts: (m.supportedReasoningEfforts || []).map(e => e.reasoningEffort)
         })));
         cursor = page.nextCursor;
-      } while (cursor && this.models.length < 500);
+        if(cursor&&seen.has(cursor))break;
+        if(cursor)seen.add(cursor);
+      } while (cursor && ++pages<10 && this.models.length < 500);
     } catch { this.error = 'Model catalog unavailable; using runtime default.'; }
     this.emitState();
   }
@@ -85,6 +87,7 @@ export class Conversation extends EventEmitter {
   async send(data) {
     if (!this.connected || this.status === 'uncertain') throw new Error('Runtime unavailable; restart the application');
     const message = this.validateMessage(data);
+    if(this.status==='stopping')throw Error('Wait for the interrupted turn to finish');
     if (this.active()) {
       if (this.queue.length >= 10) throw new Error('Queue is full');
       this.queue.push({ ...message, id: randomUUID() }); this.emitState(); return;
@@ -100,6 +103,7 @@ export class Conversation extends EventEmitter {
       if (!this.threadId) {
         const result = await this.client.request('thread/start', { cwd: this.cwd, sandbox: this.writable ? 'workspace-write' : 'read-only', approvalPolicy: 'on-request' });
         if (typeof result?.thread?.id !== 'string') throw new Error('Missing thread ID');
+        if(!this.connected)return;
         this.threadId = result.thread.id;
         // Checkpoint the native ID before dispatching any model work.
         this.emitState();
@@ -127,7 +131,9 @@ export class Conversation extends EventEmitter {
     const { method, params: p } = event;
     if (p?.threadId !== this.threadId || !this.active()) return;
     if (method === 'serverRequest/resolved') {
-      for (const [id, pending] of this.pending) if (pending.requestId === p.requestId) this.resolveApproval(id,'decline');
+      for (const [id, pending] of this.pending) if (pending.requestId === p.requestId) {
+        clearTimeout(pending.timer);this.pending.delete(id);pending.resolve(undefined);this.emitState();
+      }
       return;
     }
     if (!this.turnId) {
