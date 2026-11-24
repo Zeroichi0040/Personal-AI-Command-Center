@@ -18,8 +18,9 @@ export async function buildServer(conversation, { port = 4317, staticRoot } = {}
       .header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'none'; connect-src 'self' ws://" + host + "; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
     if (req.method !== 'GET' && (req.headers.origin !== origin || !authorized(req.headers['x-pacc-token']))) return reply.code(403).send({error:'Unauthorized'});
   });
-  app.get('/api/bootstrap', async () => ({ token, state:conversation.snapshot() }));
+  app.get('/api/bootstrap', async (_req,reply) => conversation.booting?reply.code(503).send({error:'Starting PACC'}):({ token, state:conversation.snapshot() }));
   app.post('/api/action', async (req, reply) => {
+    if(conversation.booting)return reply.code(503).send({error:'Starting PACC'});
     const data = req.body;
     try {
       if (typeof conversation.dispatch === 'function') return {ok:true,...await conversation.dispatch(data)};

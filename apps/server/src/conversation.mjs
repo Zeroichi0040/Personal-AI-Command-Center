@@ -28,7 +28,8 @@ export class Conversation extends EventEmitter {
     this.early = []; this.error = null; this.items = new Map(); this.fileChanges = new Map(); this.commandItems = new Map();
     this.client.on('notification', n => this.onEvent(n));
     this.client.on('disconnect', () => {
-      this.connected = false; this.status = 'disconnected'; this.endedAt = Date.now();
+      const wasActive=this.active()||this.status==='uncertain';
+      this.connected = false; this.status = wasActive?'uncertain':'disconnected'; this.endedAt = Date.now();
       this.queue = []; this.clearApprovals(); this.emitState();
     });
   }
@@ -58,6 +59,20 @@ export class Conversation extends EventEmitter {
     } catch { this.error = 'Model catalog unavailable; using runtime default.'; }
     this.emitState();
   }
+  async resume(saved) {
+    this.messages=structuredClone(saved.messages||[]);
+    this.startedAt=saved.startedAt??null;this.endedAt=saved.endedAt??null;
+    this.threadId=saved.threadId??null;this.queue=[];this.turnId=null;
+    await this.initialize();
+    if(this.threadId){
+      const result=await this.client.request('thread/resume',{threadId:this.threadId,cwd:this.cwd,sandbox:this.writable?'workspace-write':'read-only',approvalPolicy:'on-request'});
+      if(result?.thread?.id!==this.threadId)throw Error('Native resume returned a different thread');
+      if(result.thread.status?.type==='active'||result.thread.turns?.some(t=>t.status==='inProgress'))throw Error('Native thread is still active; inspect it in Codex before reconnecting');
+    }
+    if(!this.connected)throw Error('Runtime disconnected during recovery');
+    this.status='idle';
+    this.error=null;this.emitState();
+  }
   validateMessage(data) {
     if (!data || typeof data.text !== 'string' || !data.text.trim() || data.text.length > 40_000) throw new Error('Enter a message of 1–40000 characters');
     const model = data.model || undefined, effort = data.effort || undefined;
@@ -81,11 +96,15 @@ export class Conversation extends EventEmitter {
     this.startedAt = Date.now(); this.endedAt = null; this.items.clear(); this.fileChanges.clear(); this.commandItems.clear();
     this.messages.push({ id: randomUUID(), kind: 'user', text: message.text }); this.emitState();
     try {
+      this.checkpoint?.();
       if (!this.threadId) {
         const result = await this.client.request('thread/start', { cwd: this.cwd, sandbox: this.writable ? 'workspace-write' : 'read-only', approvalPolicy: 'on-request' });
         if (typeof result?.thread?.id !== 'string') throw new Error('Missing thread ID');
         this.threadId = result.thread.id;
+        // Checkpoint the native ID before dispatching any model work.
+        this.emitState();
       }
+      this.checkpoint?.();
       const result = await this.client.request('turn/start', {
         threadId: this.threadId, input: input(message.text), cwd: this.cwd, approvalPolicy: 'on-request',
         sandboxPolicy: this.writable ? { type: 'workspaceWrite', writableRoots: [this.cwd], networkAccess: false } : { type: 'readOnly' },

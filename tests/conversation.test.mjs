@@ -49,7 +49,7 @@ test('approval requires active scoped request and explicit single decision',asyn
 test('disconnect declines pending approval and never retries queued work',async()=>{
   const {c,client}=await setup();await c.send({text:'first'});await c.send({text:'later'});
   const p=c.requestApproval({method:'item/commandExecution/requestApproval',params:{threadId:'thread',turnId:'turn1',command:'echo x'}});
-  client.close();assert.deepEqual(await p,{decision:'decline'});assert.equal(c.status,'disconnected');assert.equal(c.queue.length,0);
+  client.close();assert.deepEqual(await p,{decision:'decline'});assert.equal(c.status,'uncertain');assert.equal(c.queue.length,0);
 });
 test('rejects invalid model and effort before any turn',async()=>{
   const {c,client}=await setup();await assert.rejects(c.send({text:'hi',model:'unknown'}));await assert.rejects(c.send({text:'hi',model:'test',effort:'high'}));assert.equal(client.n,0);
